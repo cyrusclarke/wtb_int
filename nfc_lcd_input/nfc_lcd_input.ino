@@ -7,8 +7,8 @@
 
 // === CONFIG FLAG ===
 // Uncomment the one you want to compile for
-#define USE_ADAFRUIT_BACKPACK   // Adafruit MCP23008-based
-// #define USE_GENERIC_BACKPACK    // Common PCF8574-based
+// #define USE_ADAFRUIT_BACKPACK   // Adafruit MCP23008-based
+#define USE_GENERIC_BACKPACK    // Common PCF8574-based
 
 // --- MFRC522 (SPI) pins
 #define RC522_CS    44
