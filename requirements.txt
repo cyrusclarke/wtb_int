@@ -1,0 +1,12 @@
+# Web3 and blockchain interactions
+web3>=6.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Serial communication with Arduino
+pyserial>=3.5
+
+# Audio and multimedia
+pygame>=2.5.0
+
