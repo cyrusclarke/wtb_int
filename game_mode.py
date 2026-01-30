@@ -177,8 +177,9 @@ PLAYER_TAGS = {
     "6351EAD9": "Player4", #LAND
 }
 
-# Special cancel tag
-CANCEL_TAG = "B9230502"
+# Special tags
+CANCEL_TAG = "E7360265"      # Cancel pending trade
+ROUND_END_TAG = "B9230502"   # End round and clear used blocks
 
 # Define resource cards by type
 RESOURCE_CARDS = {
@@ -215,6 +216,13 @@ RESOURCE_CARDS = {
         "5381DAD9410001",
         "53978FDA410001",
         "5398D7D9410001",
+        "53E2CCD9410001",
+        "530DD8D9410001",
+        "53E4D6D9410001",
+        "5306D5D9410001",
+        "53E3D6D9410001",
+        "53F6D3D9410001",
+        "5373CDD9410001",
     ],
     "WATER": [
         "5387D4D9410001",
@@ -276,6 +284,9 @@ pending = {
 used_block_uids = set()
 active_player = None
 
+# Thread lock for thread-safe access to game state
+state_lock = threading.Lock()
+
 # Sounds
 pygame.mixer.init()
 sounds = {
@@ -289,15 +300,34 @@ sounds = {
     "LAND": pygame.mixer.Sound(os.path.join(SOUNDS_DIR, "land.mp3")),
 }
 
+def drain_serial_buffer(ser, max_reads=5):
+    """Read and discard any data from serial buffer (used after LCD messages)."""
+    try:
+        reads = 0
+        while ser.in_waiting > 0 and reads < max_reads:
+            ser.read(ser.in_waiting)  # Read and discard
+            reads += 1
+            time.sleep(0.01)  # Small delay between reads
+    except:
+        pass
+
 def send_lcd(message, reader=None):
     """Send message to LCD screen(s). If reader specified, send to that reader only."""
     try:
         if reader == 1 or reader is None:
             ser1.write(f"DISPLAY:{message}\n".encode())
+            ser1.flush()  # Ensure data is sent immediately
+            # Drain any responses/acknowledgments
+            time.sleep(0.05)  # Small delay for Arduino to respond
+            drain_serial_buffer(ser1)
         if reader == 2 or reader is None:
             ser2.write(f"DISPLAY:{message}\n".encode())
-    except:
-        pass
+            ser2.flush()  # Ensure data is sent immediately
+            # Drain any responses/acknowledgments
+            time.sleep(0.05)  # Small delay for Arduino to respond
+            drain_serial_buffer(ser2)
+    except Exception as e:
+        print(f"LCD send error: {e}")
 
 def reset_state():
     global active_player, pending
@@ -310,6 +340,12 @@ def reset_state():
     }
     print("🔁 State reset.")
     send_lcd("Ready to scan")
+    # send_lcd already drains buffers, but do an extra clear to be safe
+    try:
+        ser1.reset_input_buffer()
+        ser2.reset_input_buffer()
+    except:
+        pass
     try:
         sounds["reset"].play()
     except:
@@ -365,14 +401,31 @@ def check_and_commit_trade(force=False):
         print(f"⚠️ Transaction failed: {e}")
         send_lcd("Tx failed")
 
+    # Aggressively clear serial buffers after trade to prevent interference
+    print("🧹 Clearing serial buffers after trade...")
+    try:
+        # Drain any remaining data
+        drain_serial_buffer(ser1, max_reads=10)
+        drain_serial_buffer(ser2, max_reads=10)
+        # Reset buffers
+        ser1.reset_input_buffer()
+        ser2.reset_input_buffer()
+        # Small delay to let things settle
+        time.sleep(0.2)
+        # One more drain attempt
+        drain_serial_buffer(ser1, max_reads=5)
+        drain_serial_buffer(ser2, max_reads=5)
+    except Exception as e:
+        print(f"Buffer clear error: {e}")
+    
     time.sleep(2)
     reset_state()
     
 def process_scan(uid):
-    global active_player, pending
+    global active_player, pending, used_block_uids
     uid = uid.strip().upper()
 
-    # Check for cancel tag - only works if there's an active trade to cancel
+    # Check for cancel tag (only cancels pending trade, doesn't clear used blocks)
     if uid == CANCEL_TAG:
         # Check if any player has selected a resource (i.e., there's something to cancel)
         has_pending_trade = any(pending[p]["resource"] is not None for p in pending)
@@ -390,9 +443,27 @@ def process_scan(uid):
             print("⚠️ No active trade to cancel.")
             send_lcd("Nothing to cancel")
         return
+    
+    # Check for round-end tag (clears used blocks, doesn't cancel pending trades)
+    if uid == ROUND_END_TAG:
+        num_used = len(used_block_uids)
+        used_block_uids.clear()
+        print("🔚 Round ended! All blocks are now tradeable again.")
+        send_lcd("Round ended")
+        if num_used > 0:
+            print(f"✓ Cleared {num_used} used block UID(s)")
+        try:
+            sounds["reset"].play()
+        except Exception as e:
+            print(f"Sound error: {e}")
+        time.sleep(1)
+        send_lcd("Ready to scan")
+        return
 
     if uid in PLAYER_TAGS:
         player = PLAYER_TAGS[uid]
+        print(f"[DEBUG] Processing player tag: {player} (UID: {uid})")
+        print(f"[DEBUG] Current active_player: {active_player}, pending[{player}]: {pending[player]}")
         
         # Check if this player already has a resource (ready to confirm)
         if pending[player]["resource"] is not None:
@@ -409,6 +480,7 @@ def process_scan(uid):
         except Exception as e:
             print(f"Sound error: {e}")
         send_lcd(f"{active_player}")
+        # Buffer clearing is now handled in the serial reading loops
         return
 
     # resource?
@@ -447,23 +519,79 @@ def serial_loop_reader1():
     """Handle scans from Reader 1 (Player1 & Player2)"""
     while True:
         try:
-            line = ser1.readline().decode().strip()
-            if line.startswith("SCAN,"):
-                uid = line.split(",")[1]
-                process_scan(uid)
+            # Read ALL available lines, not just one - this prevents buffer buildup
+            lines_processed = 0
+            while ser1.in_waiting > 0 and lines_processed < 10:  # Limit to prevent infinite loop
+                line_bytes = ser1.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                if line:
+                    if line.startswith("SCAN,"):
+                        uid = line.split(",")[1]
+                        print(f"[Reader 1] Scanned: {uid}")
+                        process_scan(uid)
+                        # After processing a scan, drain any leftover data (LCD responses, etc.)
+                        # Small delay to let LCD message be sent and responded to
+                        time.sleep(0.1)
+                        drain_serial_buffer(ser1, max_reads=5)
+                        # Only reset if there's still data (indicates leftover non-SCAN messages)
+                        if ser1.in_waiting > 0:
+                            ser1.reset_input_buffer()
+                    else:
+                        # Discard non-SCAN messages (LCD acknowledgments, etc.)
+                        print(f"[Reader 1] Discarded: {line[:50]}")  # Show first 50 chars for debugging
+                lines_processed += 1
+            # If buffer is getting too full, clear it (might indicate stuck state)
+            if ser1.in_waiting > 1000:
+                print("[Reader 1] Buffer overflow detected, clearing...")
+                ser1.reset_input_buffer()
         except Exception as e:
-            print("Reader 1 error:", e)
+            print(f"Reader 1 error: {e}")
+            try:
+                ser1.reset_input_buffer()  # Try to recover
+            except:
+                pass
+        time.sleep(0.01)  # Small delay to prevent CPU spinning
 
 def serial_loop_reader2():
     """Handle scans from Reader 2 (Player3 & Player4)"""
     while True:
         try:
-            line = ser2.readline().decode().strip()
-            if line.startswith("SCAN,"):
-                uid = line.split(",")[1]
-                process_scan(uid)
+            # Read ALL available lines, not just one - this prevents buffer buildup
+            lines_processed = 0
+            while ser2.in_waiting > 0 and lines_processed < 10:  # Limit to prevent infinite loop
+                line_bytes = ser2.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                if line:
+                    if line.startswith("SCAN,"):
+                        uid = line.split(",")[1]
+                        print(f"[Reader 2] Scanned: {uid}")
+                        process_scan(uid)
+                        # After processing a scan, drain any leftover data (LCD responses, etc.)
+                        # Small delay to let LCD message be sent and responded to
+                        time.sleep(0.1)
+                        drain_serial_buffer(ser2, max_reads=5)
+                        # Only reset if there's still data (indicates leftover non-SCAN messages)
+                        if ser2.in_waiting > 0:
+                            ser2.reset_input_buffer()
+                    else:
+                        # Discard non-SCAN messages (LCD acknowledgments, etc.)
+                        print(f"[Reader 2] Discarded: {line[:50]}")  # Show first 50 chars for debugging
+                lines_processed += 1
+            # If buffer is getting too full, clear it (might indicate stuck state)
+            if ser2.in_waiting > 1000:
+                print("[Reader 2] Buffer overflow detected, clearing...")
+                ser2.reset_input_buffer()
         except Exception as e:
-            print("Reader 2 error:", e)
+            print(f"Reader 2 error: {e}")
+            try:
+                ser2.reset_input_buffer()  # Try to recover
+            except:
+                pass
+        time.sleep(0.01)  # Small delay to prevent CPU spinning
 
 def check_for_keypress():
     while True:
@@ -484,7 +612,8 @@ threading.Thread(target=check_for_keypress, daemon=True).start()
 print("🔌 Ready for 4-player mode with 2 NFC readers!")
 print(f"   Reader 1 ({PORT1}): Player1 & Player2")
 print(f"   Reader 2 ({PORT2}): Player3 & Player4")
-print("   Scan cancel tag to reset current trade.")
+print("   Cancel tag: Reset current pending trade")
+print("   End round tag: Clear all used blocks (start new round)")
 print("   Keyboard: Press C to confirm trade, P to reset all.")
 while True:
     time.sleep(1)
